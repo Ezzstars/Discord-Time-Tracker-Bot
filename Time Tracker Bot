@@ -14,16 +14,14 @@ logging.basicConfig(level=logging.INFO)
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 
-# Replace these with your actual channel IDs
-BUTTONS_CHANNEL_ID = 111111111111111111  # Channel where buttons appear
-TIMING_CHANNEL_ID = 222222222222222222   # Channel where session logs are posted
-REPORTS_CHANNEL_ID = 333333333333333333  # Channel where weekly reports upload
+BUTTONS_CHANNEL_ID = 1435012162128183408
+TIMING_CHANNEL_ID = 1203395497843228763
+REPORTS_CHANNEL_ID = 1435037114797654136
 
 intents = discord.Intents.default()
 intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
-
 DB_FILE = "work_sessions.db"
 
 # ---------------- DATABASE ----------------
@@ -79,15 +77,12 @@ def set_meta(key: str, value: str):
     c.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", (key, str(value)))
     conn.commit(); conn.close()
 
-def ordinal(n: int) -> str:
-    return "%d%s" % (n, "tsnrhtdd"[(n // 10 % 10 != 1) * (n % 10 < 4) * n % 10 :: 4])
-
 def fmt_time_12(dt: datetime) -> str:
     return dt.astimezone().strftime("%I:%M %p").lstrip("0")
 
 def fmt_date_paren(dt: datetime) -> str:
     local = dt.astimezone()
-    return f"({ordinal(local.day)} {local.strftime('%b %Y')})"
+    return f"({local.strftime('%d %b %Y')})"
 
 def pretty_hm(seconds: float) -> str:
     seconds = int(seconds)
@@ -129,11 +124,12 @@ class TimeButtons(View):
             conn.close(); return
 
         now = datetime.now(timezone.utc)
-        msg = await timing_ch.send(
-            f"🧑 Name: {interaction.user.mention}\n"
-            f"✅ Check in: {fmt_time_12(now)} {fmt_date_paren(now)}"
-        )
+        embed = discord.Embed(color=discord.Color.green())
+        embed.add_field(name="🧑 Name", value=interaction.user.mention, inline=False)
+        embed.add_field(name="✅ Check in", value=f"{fmt_time_12(now)} {fmt_date_paren(now)}", inline=False)
+        embed.set_footer(text="Session started")
 
+        msg = await timing_ch.send(embed=embed)
         c.execute("INSERT OR REPLACE INTO sessions(user_id,name,start_time,message_id,dm_warned) VALUES(?,?,?,?,0)",
                   (user_id, name, now.isoformat(), msg.id))
         conn.commit(); conn.close()
@@ -156,32 +152,33 @@ class TimeButtons(View):
         end_dt = datetime.now(timezone.utc)
         duration = (end_dt - start_dt).total_seconds()
         limit_h = get_limit_hours(); penalty_t = get_penalty_tokens()
+        capped_seconds = limit_h * 3600
+        penalized = 0
 
         timing_ch = get_channel(TIMING_CHANNEL_ID)
         msg = await timing_ch.fetch_message(message_id)
 
-        capped_seconds = limit_h * 3600
-        penalized = 0
-
         if duration > capped_seconds:
             duration = capped_seconds
             penalized = 1
-            content = (
-                f"🧑 Name: {interaction.user.mention}\n"
-                f"✅ Check in: {fmt_time_12(start_dt)} {fmt_date_paren(start_dt)}\n"
-                f"⚠️ Warning: auto-checked out after {limit_h} hours.\n"
-                f"💀 Penalty: {penalty_t:,} SPCA sent to burn wallet.\n"
-                f"💡 Session counted: {pretty_hm(duration)}"
-            )
+            embed = discord.Embed(color=discord.Color.yellow())
+            embed.add_field(name="", value=(
+                f"🧑 **Name:** {interaction.user.mention}\n"
+                f"✅ **Check in:** {fmt_time_12(start_dt)} {fmt_date_paren(start_dt)}\n"
+                f"⚠️ **Warning:** Auto-checkout after {limit_h}h.\n"
+                f"💀 **Penalty:** {penalty_t:,} SPCA sent to burn wallet.\n"
+                f"💡 **Counted:** {pretty_hm(duration)}"
+            ), inline=False)
         else:
-            content = (
-                f"🧑 Name: {interaction.user.mention}\n"
-                f"✅ Check in: {fmt_time_12(start_dt)} {fmt_date_paren(start_dt)}\n"
-                f"🔴 Check out: {fmt_time_12(end_dt)}\n"
-                f"💡 Session: {pretty_hm(duration)}"
-            )
+            embed = discord.Embed(color=discord.Color.red())
+            embed.add_field(name="", value=(
+                f"🧑 **Name:** {interaction.user.mention}\n"
+                f"✅ **Check in:** {fmt_time_12(start_dt)} {fmt_date_paren(start_dt)}\n"
+                f"🔴 **Check out:** {fmt_time_12(end_dt)}\n"
+                f"💡 **Session:** {pretty_hm(duration)}"
+            ), inline=False)
 
-        # update totals
+        # update DB
         c.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
         c.execute("SELECT total_seconds FROM totals WHERE user_id=?", (user_id,))
         prev = c.fetchone()
@@ -193,10 +190,10 @@ class TimeButtons(View):
                   (user_id, name, start_dt.isoformat(), end_dt.isoformat(), duration, penalized))
         conn.commit(); conn.close()
 
-        await msg.edit(content=content)
+        await msg.edit(embed=embed)
         await interaction.response.send_message("✅ Session saved!", ephemeral=True)
 
-# ---------------- AUTO CHECKER WITH DM REMINDER ----------------
+# ---------------- AUTO CHECKER ----------------
 @tasks.loop(minutes=5)
 async def monitor_sessions():
     limit_h = get_limit_hours()
@@ -214,37 +211,28 @@ async def monitor_sessions():
         elapsed = (now - start_dt).total_seconds()
         warn_time = (limit_h * 3600) - (reminder_m * 60)
 
-        # DM Reminder before auto-checkout
+        # DM Reminder
         if elapsed >= warn_time and not dm_warned:
             try:
                 user = await bot.fetch_user(int(user_id))
-                remaining = (limit_h * 3600) - elapsed
-                rem_h, rem_m = divmod(int(remaining // 60), 60)
-                rem_text = f"{rem_h}h {rem_m}m" if rem_h > 0 else f"{rem_m}m"
-
-                reminder_msg = (
-                    f"⏰ **Hey {user.mention}!**\n"
+                await user.send(
+                    f"⏰ **Hey {user.name}!**\n"
                     f"You’ve been clocked in for **{pretty_hm(elapsed)}**.\n"
-                    f"You have **{rem_text} left** before auto-checkout will apply a **{penalty_t:,} SPCA** penalty.\n\n"
+                    f"You have **{reminder_m}m left** before auto-checkout applies a **{penalty_t:,} SPCA** penalty.\n\n"
                     f"📍 **Check-out channel:** <#{BUTTONS_CHANNEL_ID}>\n"
-                    f"🏢 **Server:** *Ezzstar Office*\n\n"
-                    f"Please **check out soon** to avoid the penalty."
+                    f"🏢 **Server:** Ezzstar Office"
                 )
-
-                await user.send(reminder_msg)
-                c.execute("UPDATE sessions SET dm_warned = 1 WHERE user_id = ?", (user_id,))
+                c.execute("UPDATE sessions SET dm_warned = 1 WHERE user_id=?", (user_id,))
                 conn.commit()
-                logging.info(f"✅ Sent DM reminder to {name} ({user_id})")
             except Exception as e:
-                logging.warning(f"⚠️ Failed to DM {user_id}: {e}")
+                logging.warning(f"DM failed for {user_id}: {e}")
 
-        # Auto-checkout after limit
+        # Auto-checkout
         if elapsed >= limit_h * 3600:
             c.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
             c.execute("SELECT total_seconds FROM totals WHERE user_id=?", (user_id,))
             prev = c.fetchone()
             new_total = limit_h * 3600 + (prev[0] if prev else 0)
-
             c.execute("INSERT OR REPLACE INTO totals(user_id,name,total_seconds) VALUES(?,?,?)",
                       (user_id, name, new_total))
             c.execute("""INSERT INTO history(user_id,name,start_time,end_time,duration_seconds,penalty_applied)
@@ -255,20 +243,21 @@ async def monitor_sessions():
             ch = get_channel(TIMING_CHANNEL_ID)
             try:
                 msg = await ch.fetch_message(msg_id)
-                content = (
-                    f"🧑 Name: <@{user_id}>\n"
-                    f"✅ Check in: {fmt_time_12(start_dt)} {fmt_date_paren(start_dt)}\n"
-                    f"⚠️ Warning: auto-checked out after {limit_h} hours.\n"
-                    f"💀 Penalty: {penalty_t:,} SPCA sent to burn wallet.\n"
-                    f"💡 Session counted: {pretty_hm(limit_h * 3600)}"
-                )
-                await msg.edit(content=content)
+                embed = discord.Embed(color=discord.Color.yellow())
+                embed.add_field(name="", value=(
+                    f"🧑 **Name:** <@{user_id}>\n"
+                    f"✅ **Check in:** {fmt_time_12(start_dt)} {fmt_date_paren(start_dt)}\n"
+                    f"⚠️ **Warning:** Auto-checkout after {limit_h}h.\n"
+                    f"💀 **Penalty:** {penalty_t:,} SPCA sent to burn wallet.\n"
+                    f"💡 **Counted:** {limit_h} h 0 m"
+                ), inline=False)
+                await msg.edit(embed=embed)
             except Exception as e:
                 logging.warning(f"Edit failed: {e}")
     conn.close()
 
 # ---------------- WEEKLY REPORT ----------------
-@tasks.loop(time=dtime(hour=23, minute=59))
+@tasks.loop(time=dtime(hour=0, minute=0))
 async def weekly_report():
     if datetime.now().weekday() != 6:
         return
@@ -282,48 +271,47 @@ async def weekly_report():
               (start.isoformat(), end.isoformat()))
     penalized = dict(c.fetchall()); conn.close()
 
-    rows = []
-    for name, secs in totals:
-        rows.append({
-            "Name": name,
-            "Total Hours (last 7 days)": round(secs / 3600, 2),
-            "Penalized Sessions": penalized.get(name, 0)
-        })
+    if not totals:
+        return
 
-    if not rows:
-        rows = [{"Name": "No sessions", "Total Hours (last 7 days)": 0, "Penalized Sessions": 0}]
-    df = pd.DataFrame(rows)
+    sorted_data = sorted(totals, key=lambda x: x[1], reverse=True)
+    embed = discord.Embed(title="🏆 Weekly Leaderboard 🏆", color=discord.Color.gold())
+
+    for i, (name, secs) in enumerate(sorted_data[:3]):
+        rank = ["🥇", "🥈", "🥉"][i] if i < 3 else f"#{i+1}"
+        embed.add_field(
+            name=f"{rank} {name}",
+            value=f"🧭 Total time: {pretty_hm(secs)}\n⚠️ Penalties: {penalized.get(name, 0)}",
+            inline=False
+        )
+
+    df = pd.DataFrame([{
+        "Name": n,
+        "Total Hours": round(s / 3600, 2),
+        "Penalties": penalized.get(n, 0)
+    } for n, s in totals])
     fname = f"weekly_summary_{datetime.now().strftime('%Y_%m_%d')}.xlsx"
     df.to_excel(fname, index=False)
     ch = get_channel(REPORTS_CHANNEL_ID)
-    if ch:
-        await ch.send(content="📊 Weekly Summary", file=discord.File(fname))
+    await ch.send(embed=embed, file=discord.File(fname))
 
-# ---------------- SLASH COMMANDS ----------------
+# ---------------- COMMANDS ----------------
 @tree.command(name="post_buttons", description="Post Check In/Out buttons")
 async def post_buttons(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("❌ Admins only.", ephemeral=True); return
-    if interaction.channel_id != BUTTONS_CHANNEL_ID:
-        await interaction.response.send_message("⚠️ Use this in the buttons channel.", ephemeral=True); return
+        await interaction.response.send_message("❌ Admin only.", ephemeral=True); return
     await interaction.channel.send("🕒 Click below to Check In / Check Out", view=TimeButtons())
     await interaction.response.send_message("✅ Buttons posted!", ephemeral=True)
 
-@tree.command(name="update_limit", description="Admin: update session hours, penalty, or reminder.")
-@app_commands.describe(hours="Max hours", penalty="Penalty SPCA", reminder="Minutes before auto-checkout to DM reminder")
+@tree.command(name="update_limit", description="Admin: update session limits, penalty, reminder")
 async def update_limit(interaction: discord.Interaction, hours: int, penalty: int, reminder: int):
     if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("❌ Admins only.", ephemeral=True); return
-    if hours < 1 or hours > 24:
-        await interaction.response.send_message("⚠️ Hours must be 1–24.", ephemeral=True); return
-    if reminder < 5 or reminder > (hours * 60):
-        await interaction.response.send_message("⚠️ Reminder must be within session time.", ephemeral=True); return
-
+        await interaction.response.send_message("❌ Admin only.", ephemeral=True); return
     set_meta("max_session_hours", str(hours))
     set_meta("penalty_tokens", str(penalty))
     set_meta("reminder_minutes", str(reminder))
     await interaction.response.send_message(
-        f"✅ Limit set to {hours}h, penalty {penalty:,} SPCA, reminder {reminder} minutes before auto-checkout.",
+        f"✅ Updated: Limit {hours}h, Penalty {penalty:,} SPCA, Reminder {reminder}m before auto-checkout.",
         ephemeral=True
     )
 
@@ -331,8 +319,8 @@ async def update_limit(interaction: discord.Interaction, hours: int, penalty: in
 @bot.event
 async def on_ready():
     bot.add_view(TimeButtons())
-    synced = await tree.sync()
-    print(f"✅ Logged in as {bot.user} | Synced {len(synced)} commands")
+    await tree.sync()
+    print(f"✅ Logged in as {bot.user}")
     monitor_sessions.start()
     weekly_report.start()
 
